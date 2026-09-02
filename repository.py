@@ -40,11 +40,12 @@ _FIND_NODE_SQL = (
 )
 
 # Машина §5.4 шаг 3a: кандидаты-узлы — предки целевого пути (точный матч включён).
+# Предки собираются в Python: LIKE path||'/%' трактует %/_ в имени как wildcard.
 # Дизъюнкта OR n.path = '' нет: гранта на '' не существует как класс (ревизия 5).
 _ANCESTORS_SQL = (
     "SELECT node_uuid, path FROM fs.nodes "
     "WHERE owner_user_id = %s::uuid AND deleted_at IS NULL "
-    "AND (%s = path OR %s LIKE path || '/%')"
+    "AND path = ANY(%s::text[])"
 )
 
 # Машина §5.4 шаг 3b: самый специфичный грант. Семантика auth повторяется
@@ -65,7 +66,7 @@ _BEST_GRANT_SQL = (
 _SHAREABLE_ROOT_SQL = (
     "SELECT 1 FROM fs.nodes "
     "WHERE owner_user_id = %s::uuid AND deleted_at IS NULL AND is_shareable_root "
-    "AND (%s = path OR %s LIKE path || '/%') LIMIT 1"
+    "AND path = ANY(%s::text[]) LIMIT 1"
 )
 
 _MARK_ROOT_SQL = (
@@ -230,7 +231,8 @@ class FsRepository:
         return rows[0] if rows else None
 
     def shareable_root_exists(self, owner: str, rel: str) -> bool:
-        return bool(self.fetch(_SHAREABLE_ROOT_SQL, owner, rel, rel))
+        prefixes = _self_and_ancestors(rel)
+        return bool(prefixes) and bool(self.fetch(_SHAREABLE_ROOT_SQL, owner, prefixes))
 
     def mark_shareable_root(self, owner: str, rel: str) -> bool:
         """Повторная линковка того же пути → флаг в TRUE (§5.6.1)."""
@@ -261,7 +263,10 @@ class FsRepository:
         """Самый специфичный грант requester'а на канонический rel, или None.
 
         Кеша нет — отзыв мгновенный (§18); один-два indexed lookup на запрос."""
-        uuids = [str(row["node_uuid"]) for row in self.fetch(_ANCESTORS_SQL, owner, canon_rel, canon_rel)]
+        prefixes = _self_and_ancestors(canon_rel)
+        if not prefixes:
+            return None
+        uuids = [str(row["node_uuid"]) for row in self.fetch(_ANCESTORS_SQL, owner, prefixes)]
         if not uuids:
             return None
         rows = self.fetch(_BEST_GRANT_SQL, uuids, requester, requester)
@@ -363,6 +368,14 @@ class FsRepository:
         if not group_ids:
             return []
         return [str(row["user_id"]) for row in self.fetch(_MEMBERS_SQL, group_ids)]
+
+
+def _self_and_ancestors(rel: str) -> list[str]:
+    """Канонический rel и предки. Пустой rel → [] (гранта на '' нет, NOT_SHAREABLE)."""
+    if not rel:
+        return []
+    parts = rel.split("/")
+    return ["/".join(parts[:i]) for i in range(len(parts), 0, -1)]
 
 
 def _restore_candidate(trashed_rel: str) -> str | None:
