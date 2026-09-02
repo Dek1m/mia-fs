@@ -1,7 +1,7 @@
 """FsProvider — RPC fs.* (ADR-002 §4).
 
-type="io" (диск — I/O). owner-only каркас: ACL-машина — шаг 5 (ревью Литы),
-чужой owner уже сейчас fail closed (ACL_DENIED).
+type="io" (диск — I/O). ACL-машина §5.4 на каждом затрагиваемом пути;
+share_* — только владелец (§5.7).
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ __all__ = ["FsProvider"]
 
 
 class FsProvider:
-    """Дисковые RPC в песочнице владельца. SQL отсутствует (шаг 5 добавит реестр)."""
+    """Дисковые RPC в песочнице владельца + identity-based ACL."""
 
     def __init__(self, accessor: FsAccessor, log: Any = None) -> None:
         self._accessor = accessor
@@ -44,7 +44,7 @@ class FsProvider:
         api=True,
         permission="fs:read",
         name="list",
-        description="Листинг каталога (своего или расшаренного, ACL — шаг 5)",
+        description="Листинг каталога (своего или расшаренного)",
         args={"rel_path": "str", "owner": "str", "include_hidden": "bool", "include_size": "bool"},
         return_type="dict",
     )
@@ -154,7 +154,7 @@ class FsProvider:
         api=True,
         permission="fs:write",
         name="move",
-        description="Перемещение внутри home; обновление fs.nodes — шаг 5",
+        description="Перемещение внутри home + обновление fs.nodes.path",
         args={"src": "str", "dest_dir": "str", "owner": "str"},
         return_type="dict",
     )
@@ -174,7 +174,7 @@ class FsProvider:
         api=True,
         permission="fs:write",
         name="rename",
-        description="Переименование; обновление fs.nodes — шаг 5",
+        description="Переименование + обновление fs.nodes.path/display_name",
         args={"src": "str", "new_name": "str", "owner": "str"},
         return_type="dict",
     )
@@ -194,7 +194,7 @@ class FsProvider:
         api=True,
         permission="fs:write",
         name="trash",
-        description="Перенос в ~/Trash/belle/{utc}/{rel}; fs.nodes.deleted_at — шаг 5",
+        description="Перенос в ~/Trash/belle/{utc}/{rel} + fs.nodes.deleted_at",
         args={"rel_path": "str", "owner": "str"},
         return_type="dict",
     )
@@ -236,26 +236,69 @@ class FsProvider:
         return_type="dict",
     )
     def list_shared(self, _session_user_id: str | None = None) -> dict[str, Any]:
-        self._user(_session_user_id)
-        # TODO(ADR-002 шаг 5): SELECT по fs.nodes × fs.acl с membership + Everyone (§9);
-        # до ACL-машины грантов не существует — честный пустой список.
-        #
-        # Ленивая регистрация узла — один CTE, не INSERT+SELECT двумя стейтментами.
-        # Предикат deleted_at IS NULL в conflict_target ОБЯЗАТЕЛЕН: без него PG
-        # не найдёт арбитра частичного индекса nodes_owner_path_live_idx (§5.0):
-        #   WITH ins AS (
-        #       INSERT INTO fs.nodes (owner_user_id, path, node_type, display_name)
-        #       VALUES (:owner, :path, :type, basename(:path))
-        #       ON CONFLICT (owner_user_id, path) WHERE deleted_at IS NULL
-        #       DO NOTHING RETURNING node_uuid)
-        #   SELECT node_uuid FROM ins
-        #   UNION ALL
-        #   SELECT node_uuid FROM fs.nodes
-        #   WHERE owner_user_id = :owner AND path = :path AND deleted_at IS NULL
-        #   LIMIT 1;
-        #
-        # Арбитраж повторных грантов ДОСЛОВНО повторяет выражение
-        # acl_unique_grant_idx (§5.1), иначе ON CONFLICT не найдёт арбитр:
-        #   ON CONFLICT (node_uuid, grantee_type, COALESCE(grantee_user_id, grantee_group_id))
-        #   DO NOTHING;
-        return {"items": []}
+        return self._accessor.list_shared(self._user(_session_user_id))
+
+    @task(
+        type="io",
+        api=True,
+        permission="fs:share",
+        name="share_list",
+        description="ACL-таблица пути (только владелец)",
+        args={"path": "str"},
+        return_type="dict",
+    )
+    def share_list(self, path: str, _session_user_id: str | None = None) -> dict[str, Any]:
+        return self._accessor.share_list(self._user(_session_user_id), path)
+
+    @task(
+        type="io",
+        api=True,
+        permission="fs:share",
+        name="share_add",
+        description="Выдать доступ; идемпотентно → added[]/skipped[] + уведомления",
+        args={"path": "str", "grantees": "list", "level": "str"},
+        return_type="dict",
+    )
+    def share_add(
+        self,
+        path: str,
+        grantees: list[dict[str, str]],
+        level: str,
+        _session_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._accessor.share_add(self._user(_session_user_id), path, grantees, level)
+
+    @task(
+        type="io",
+        api=True,
+        permission="fs:share",
+        name="share_remove",
+        description="Отозвать доступ",
+        args={"path": "str", "grantee_type": "str", "grantee_id": "str"},
+        return_type="dict",
+    )
+    def share_remove(
+        self,
+        path: str,
+        grantee_type: str,
+        grantee_id: str,
+        _session_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        user = self._user(_session_user_id)
+        return self._accessor.share_remove(user, path, grantee_type, grantee_id)
+
+    @task(
+        type="io",
+        api=True,
+        permission="fs:share",
+        name="resolve_entities",
+        description="Batch-проверка существования: uuid/email/phone/username/groupname",
+        args={"inputs": "list"},
+        return_type="dict",
+    )
+    def resolve_entities(
+        self,
+        inputs: list[str],
+        _session_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._accessor.resolve_entities(self._user(_session_user_id), inputs)

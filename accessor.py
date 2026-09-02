@@ -67,12 +67,17 @@ class FsAccessor:
         log: Any,
         database: Any | None = None,
         auth: Any | None = None,
+        notification: Any | None = None,
     ) -> None:
         self._config = config
         self._log = log
         self._database = database
         self._auth = auth
         self._accounts = UnixAccountsRepository(database) if database is not None else None
+        from .repository import FsRepository
+
+        self._repo = FsRepository(database, log) if database is not None else None
+        self._notification = notification
 
     # ── Нормализация пользователя ───────────────────────────
 
@@ -111,12 +116,14 @@ class FsAccessor:
         """Корень песочницы владельца: /home/{username} as-is, без нормализации."""
         return Path(self._config.home_root) / username
 
-    def _sandbox(self, user: str, owner: str | None, rel: str) -> tuple[Path, str]:
+    def _sandbox(self, user: str, owner: str | None, rel: str, need: str = "viewer") -> tuple[Path, str]:
         """Песочница операции: (канонический корень, канонический rel).
 
         Порядок обязательный (аксиома §5.4): join_rel (песочница) →
         канонический rel → ACL-машина → диск. Сырой rel от клиента в ACL
-        не попадает никогда — иначе LIKE-префикс открывает обход через `..`."""
+        не попадает никогда — иначе LIKE-префикс `shared/%` открывает
+        `shared/../secret` (находка 2 Литы). Машина смотрит только uuid;
+        unix-UID ей не виден (ревизия 6)."""
         requester_id, requester_name = self._identity(user)
         owner_id, owner_name = (requester_id, requester_name)
         if owner is not None:
@@ -124,10 +131,34 @@ class FsAccessor:
         root = self._root_for(owner_name).resolve()
         resolved = join_rel(root, rel)
         canon_rel = resolved.relative_to(root).as_posix()
+        if canon_rel == ".":
+            canon_rel = ""
         if owner_id != requester_id:
-            # TODO(ADR-002 шаг 5): ACL-lookup fs.nodes/fs.acl (машина §5.4)
-            raise FsError("acl lookup not available", "ACL_DENIED")
+            self._require_grant(requester_id, owner_id, canon_rel, need)
         return root, canon_rel
+
+    def _require_grant(self, requester: str, owner: str, canon_rel: str, need: str) -> None:
+        """Гибридная проверка §5.4: префикс-предки × самый специфичный грант.
+
+        Никакого админ-обхода (§5.7): ни одна роль не проходит машину мимо грантов."""
+        from .repository import LEVELS
+
+        # write-операции передают editor; чтение — viewer (алиас read → viewer)
+        need_level = "editor" if need in {"editor", "write"} else "viewer"
+        if self._repo is None:
+            raise FsError("access denied", "ACL_DENIED")
+        level = self._repo.effective_level(owner, canon_rel, requester)
+        if level is None or LEVELS[level] < LEVELS[need_level]:
+            self._log.warning(
+                "fs_acl_denied",
+                extra={
+                    "user_id": requester,
+                    "owner": owner,
+                    "rel_path": canon_rel[:512],
+                    "required_level": need,
+                },
+            )
+            raise FsError("access denied", "ACL_DENIED")
 
     @contextmanager
     def _measure(self, operation: str, rel_path: str, user: str) -> Iterator[None]:
@@ -315,7 +346,7 @@ class FsAccessor:
         if kind not in {"folder", "file"}:
             raise FsError("invalid kind", "INVALID_NAME")
         with self._measure("mkdir" if kind == "folder" else "touch", rel, user):
-            root, _canon_rel = self._sandbox(user, owner, rel)
+            root, _canon_rel = self._sandbox(user, owner, rel, need="editor")
             uid = self._uid_for_chown(owner or user)
             # raw rel: lstat-guard §10 п.3 обязан видеть symlink-компоненты
             return ensure_nested(str(root), rel, kind, uid)
@@ -356,36 +387,78 @@ class FsAccessor:
                 raise FsError("invalid base64", "INVALID_NAME") from exc
             if len(content) > self._config.max_write_bytes:
                 raise FsError("payload too large", "PAYLOAD_TOO_LARGE")
-            root, _canon_rel = self._sandbox(user, owner, rel)
+            root, _canon_rel = self._sandbox(user, owner, rel, need="editor")
             # raw rel в write_file: O_NOFOLLOW + lstat-guard (§10 п.3)
             write_file(root, rel, content)
             return {"rel_path": _canon_rel, "size": len(content)}
 
     def move(self, user: str, src: str, dest_dir: str, *, owner: str | None = None) -> str:
         with self._measure("move", src, user):
-            root, _canon_src = self._sandbox(user, owner, src)
-            _dest_root, _canon_dest = self._sandbox(user, owner, dest_dir)
+            # Двухпутевая проверка (§4, находка 3): ACL на ОБА пути, оба ≥ уровня
+            root, canon_src = self._sandbox(user, owner, src, need="editor")
+            _dest_root, _canon_dest = self._sandbox(user, owner, dest_dir, need="editor")
             new_rel = move_into(root, src, dest_dir)
-            self._registry_after_move(root, new_rel)
+            self._registry_after_move(user, "move", src, new_rel)
             return new_rel
 
     def rename(self, user: str, src: str, new_name: str, *, owner: str | None = None) -> str:
         with self._measure("rename", src, user):
-            root, _canon_src = self._sandbox(user, owner, src)
+            # Однопутевая проверка (§4): dest в том же каталоге, каталог не меняется
+            root, _canon_src = self._sandbox(user, owner, src, need="editor")
             new_rel = rename_path(root, src, new_name)
-            self._registry_after_move(root, new_rel)
+            self._registry_after_move(user, "rename", src, new_rel)
             return new_rel
 
-    def _registry_after_move(self, root: Path, new_rel: str) -> None:
-        # TODO(ADR-002 шаг 5): UPDATE fs.nodes.path/display_name (§5.2) — FsRepository
-        return None
+    def _registry_after_move(self, user: str, operation: str, old_rel: str, new_rel: str) -> None:
+        """UPDATE fs.nodes после диска (§5.2): rename/move — path; из Trash — restore.
+
+        Ошибка UPDATE не откатывает диск (§5.2 п.4): WARN + метрика,
+        рассинхронизация самотерапевтична следующей операцией владельца."""
+        if self._repo is None:
+            return
+        from .metrics import fs_nodes_update_failed
+
+        owner_id, _username = self._identity(user)
+        try:
+            updated = self._repo.update_path(owner_id, old_rel, new_rel)
+            if updated:
+                self._log.info(
+                    "fs_nodes_registry_updated",
+                    extra={"operation": operation, "path": new_rel[:512]},
+                )
+        except Exception as exc:
+            fs_nodes_update_failed.labels(operation=operation).inc()
+            self._log.warning(
+                "fs_nodes_update_failed",
+                extra={"operation": operation, "error_type": exc.__class__.__name__},
+            )
 
     def trash(self, user: str, rel: str, *, owner: str | None = None) -> str:
         with self._measure("trash", rel, user):
-            root, _canon_rel = self._sandbox(user, owner, rel)
+            root, _canon_rel = self._sandbox(user, owner, rel, need="editor")
             trashed_rel = trash_move(root, rel)
-            # TODO(ADR-002 шаг 5): UPDATE fs.nodes.deleted_at (§5.2) — FsRepository
+            # destination в Trash создаётся воркером и получателем не проверяется (§4)
+            self._registry_trashed(user, rel)
             return trashed_rel
+
+    def _registry_trashed(self, user: str, rel: str) -> None:
+        if self._repo is None:
+            return
+        from .metrics import fs_nodes_update_failed
+
+        owner_id, _username = self._identity(user)
+        try:
+            if self._repo.mark_deleted(owner_id, rel):
+                self._log.info(
+                    "fs_nodes_registry_updated",
+                    extra={"operation": "trash", "path": rel[:512]},
+                )
+        except Exception as exc:
+            fs_nodes_update_failed.labels(operation="trash").inc()
+            self._log.warning(
+                "fs_nodes_update_failed",
+                extra={"operation": "trash", "error_type": exc.__class__.__name__},
+            )
 
     def remove_outside_home(self, path: Path) -> None:
         """Для workspace.delete_workspace: root вне home_root (§3).
@@ -405,6 +478,329 @@ class FsAccessor:
 
     def folder_stats(self, path: Path) -> tuple[int, int]:
         return folder_stats(path)
+
+    # ── Shareable roots (§5.6) — внутренние методы для workspace ──
+
+    def register_shareable_root(self, user: str, rel: str) -> dict[str, Any]:
+        """Линковка воркспейса: exists + узел c is_shareable_root=TRUE (§5.6.2).
+
+        rel='' → NOT_SHAREABLE (гранта на весь home не существует как класс).
+        Путь не существует → NOT_FOUND (линковка несуществующего невозможна).
+        Идемпотентен: повторная линковка возвращает флаг в TRUE."""
+        with self._measure("register_shareable_root", rel, user):
+            user_id, _username = self._identity(user)
+            rel = rel.strip().lstrip("/").rstrip("/")
+            if not rel:
+                raise FsError("home root is not shareable", "NOT_SHAREABLE")
+            root, canon_rel = self._sandbox(user, None, rel, need="editor")
+            path = root / canon_rel if canon_rel else root
+            if not path.exists():
+                raise FsError("path not found", "NOT_FOUND")
+            if self._repo is None:
+                raise FsError("registry unavailable", "FS_ERROR")
+            node_type = "dir" if path.is_dir() else "file"
+            existing = self._repo.find_node(user_id, canon_rel)
+            already = bool(existing and existing["is_shareable_root"])
+            if already:
+                node_uuid = str(existing["node_uuid"])
+            else:
+                if not self._repo.mark_shareable_root(user_id, canon_rel):
+                    node_uuid = self._repo.ensure_node(user_id, canon_rel, node_type, True)
+                else:
+                    node_uuid = str(self._repo.find_node(user_id, canon_rel)["node_uuid"])
+            self._log.info(
+                "fs_nodes_registry_updated",
+                extra={"operation": "register", "node_uuid": node_uuid, "path": canon_rel[:512]},
+            )
+            return {"node_uuid": node_uuid, "path": canon_rel, "already_registered": already}
+
+    def unregister_shareable_root(self, user: str, rel: str) -> dict[str, Any]:
+        """Отлинковка: флаг снимается, узел и гранты живут (политика §5.6.3).
+
+        Идемпотентный no-op, если узла/флага нет → unmarked: False."""
+        with self._measure("unregister_shareable_root", rel, user):
+            user_id, _username = self._identity(user)
+            rel = rel.strip().lstrip("/").rstrip("/")
+            if not rel:
+                raise FsError("home root is not shareable", "NOT_SHAREABLE")
+            root, canon_rel = self._sandbox(user, None, rel, need="editor")
+            if self._repo is None:
+                raise FsError("registry unavailable", "FS_ERROR")
+            node = self._repo.find_node(user_id, canon_rel)
+            unmarked = self._repo.clear_shareable_root(user_id, canon_rel)
+            node_uuid = str(node["node_uuid"]) if node else None
+            if unmarked:
+                self._log.info(
+                    "fs_nodes_registry_updated",
+                    extra={"operation": "unregister", "node_uuid": node_uuid, "path": canon_rel[:512]},
+                )
+            return {"node_uuid": node_uuid, "unmarked": unmarked}
+
+    # ── Шаринг: share_* / list_shared / resolve_entities ────
+
+    def share_add(self, user: str, path: str, grantees: list[dict[str, str]], level: str) -> dict[str, Any]:
+        """Выдать доступ (§8.1): валидации до INSERT, идемпотентно, added/skipped.
+
+        Порядок: canon rel → NOT_SHAREABLE-проверки → узел → квота → INSERT →
+        COMMIT → уведомления по added[] (graceful, §8.2 ADR-003)."""
+        from .errors import FS_QUOTA_EXCEEDED, NOT_SHAREABLE
+        from .metrics import fs_share_grants_added, fs_share_operations_total
+        from .repository import GRANT_QUOTA, LEVELS
+
+        try:
+            if level not in LEVELS:
+                raise FsError("invalid level", "INVALID_NAME")
+            owner_id, owner_name = self._identity(user)
+            # share_* — только владелец (§5.7): requester обязан быть owner
+            self._own_scope(user, owner_id)
+            if not grantees or not isinstance(grantees, list):
+                raise FsError("grantees required", "VALIDATION")
+            try:
+                clean = [{"type": str(g["type"]), "id": str(g["id"])} for g in grantees]
+            except (KeyError, TypeError) as exc:
+                raise FsError("grantees required", "VALIDATION") from exc
+            if any(g["type"] not in {"user", "group"} for g in clean):
+                raise FsError("invalid grantee type", "VALIDATION")
+            root, canon_rel = self._sandbox(user, None, path, need="editor")
+            # Валидация §5.6.3: rel='' → NOT_SHAREABLE немедленно; иначе — живой корень
+            if not canon_rel:
+                raise FsError("home root is not shareable", NOT_SHAREABLE)
+            if self._repo is None:
+                raise FsError("registry unavailable", "FS_ERROR")
+            if not self._repo.shareable_root_exists(owner_id, canon_rel):
+                raise FsError("path is not under a linked workspace root", NOT_SHAREABLE)
+            disk_path = root / canon_rel
+            if not disk_path.exists():
+                raise FsError("path not found", "NOT_FOUND")
+            node_uuid = self._repo.ensure_node(owner_id, canon_rel, "dir" if disk_path.is_dir() else "file", False)
+            # Самогрант и существующие — skipped; новые — INSERT (§20.6)
+            existing = self._repo.grant_keys(node_uuid)
+            skipped: list[dict[str, str]] = []
+            fresh: list[dict[str, str]] = []
+            for grantee in clean:
+                key = (grantee["type"], grantee["id"])
+                if grantee["type"] == "user" and grantee["id"] == owner_id:
+                    skipped.append({**grantee, "reason": "self_grant"})
+                elif key in existing:
+                    skipped.append({**grantee, "reason": "already_granted"})
+                else:
+                    fresh.append(grantee)
+            if fresh and self._repo.quota_count(owner_id) + len(fresh) > GRANT_QUOTA:
+                raise FsError("grant quota exceeded", FS_QUOTA_EXCEEDED)
+            added_keys = self._repo.insert_grants(node_uuid, fresh, level, owner_id)
+            info = self._repo.grantees_info(added_keys + [dict(g) for g in skipped])
+            added = [self._grantee_row(g, info, level) for g in added_keys]
+            skipped_rows = [
+                {
+                    "grantee_type": g["type"],
+                    "grantee_id": g["id"],
+                    "name": info.get((g["type"], g["id"]), {}).get("name", ""),
+                    "reason": g["reason"],
+                }
+                for g in skipped
+            ]
+            fs_share_grants_added.labels(outcome="added").inc(len(added_keys))
+            fs_share_grants_added.labels(outcome="skipped").inc(len(skipped_rows))
+        except Exception:
+            fs_share_operations_total.labels(operation="share_add", outcome="error").inc()
+            raise
+        fs_share_operations_total.labels(operation="share_add", outcome="ok").inc()
+        self._log.info(
+            "fs_share_changed",
+            extra={
+                "operation": "share_add", "node_uuid": node_uuid,
+                "added": len(added_keys), "skipped": len(skipped_rows), "actor": owner_name,
+            },
+        )
+        # Уведомления — только по added[] (вердикт §20.6), graceful (§8.2 ADR-003)
+        self._notify_share_grant(
+            owner_id=owner_id,
+            owner_name=owner_name,
+            node_uuid=node_uuid,
+            node_name=canon_rel.rsplit("/", 1)[-1],
+            node_kind="dir" if disk_path.is_dir() else "file",
+            level=level,
+            added=added,
+        )
+        return {"added": added, "skipped": skipped_rows}
+
+    @staticmethod
+    def _grantee_row(grantee: dict[str, str], info: dict[Any, Any], level: str) -> dict[str, Any]:
+        meta = info.get((grantee["type"], grantee["id"]), {})
+        return {
+            "grantee_type": grantee["type"],
+            "grantee_id": grantee["id"],
+            "name": meta.get("name", ""),
+            "active": bool(meta.get("active", True)),
+            "level": level,
+        }
+
+    def share_remove(self, user: str, path: str, grantee_type: str, grantee_id: str) -> dict[str, Any]:
+        """Отозвать доступ (§8.1): по node_uuid+grantee, мгновенный эффект (§18)."""
+        from .metrics import fs_share_operations_total
+
+        owner_id, owner_name = self._identity(user)
+        try:
+            self._own_scope(user, owner_id)
+            root, canon_rel = self._sandbox(user, None, path, need="editor")
+            removed = self._repo.share_remove(owner_id, canon_rel, grantee_type, grantee_id)
+        except Exception:
+            fs_share_operations_total.labels(operation="share_remove", outcome="error").inc()
+            raise
+        fs_share_operations_total.labels(operation="share_remove", outcome="ok").inc()
+        self._log.info(
+            "fs_share_changed",
+            extra={
+                "operation": "share_remove", "path": canon_rel[:512],
+                "grantee_type": grantee_type, "grantee_id": grantee_id, "actor": owner_name,
+            },
+        )
+        return {"removed": removed}
+
+    def share_list(self, user: str, path: str) -> dict[str, Any]:
+        """ACL-таблица пути — только владелец (§8.1); active из auth."""
+        from .metrics import fs_share_operations_total
+
+        owner_id, _owner_name = self._identity(user)
+        try:
+            self._own_scope(user, owner_id)
+            root, canon_rel = self._sandbox(user, None, path, need="viewer")
+            items = self._repo.share_list(owner_id, canon_rel) if canon_rel else []
+        except Exception:
+            fs_share_operations_total.labels(operation="share_list", outcome="error").inc()
+            raise
+        fs_share_operations_total.labels(operation="share_list", outcome="ok").inc()
+        return {
+            "items": [
+                {
+                    "grantee_type": row["grantee_type"],
+                    "grantee_id": row["grantee_id"],
+                    "name": row["name"],
+                    "active": bool(row["active"]),
+                    "level": row["level"],
+                    "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                }
+                for row in items
+            ],
+        }
+
+    def list_shared(self, user: str) -> dict[str, Any]:
+        """Корни, расшаренные на меня (§9): fs.nodes × fs.acl, deleted_at фильтр."""
+        from .metrics import fs_share_operations_total
+
+        me, _me_name = self._identity(user)
+        try:
+            items = self._repo.list_shared(me)
+        except Exception:
+            fs_share_operations_total.labels(operation="list_shared", outcome="error").inc()
+            raise
+        fs_share_operations_total.labels(operation="list_shared", outcome="ok").inc()
+        return {
+            "items": [
+                {
+                    "owner_user_id": row["owner_user_id"],
+                    "owner_username": row["owner_username"],
+                    "path": row["path"],
+                    "name": row["display_name"],
+                    "level": row["level"],
+                }
+                for row in items
+            ],
+        }
+
+    def resolve_entities(self, user: str, inputs: list[str]) -> dict[str, Any]:
+        """AD-подобный batch-поиск (§8.2): resolved|unresolved|ambiguous.
+
+        Не только владелец: диалог Add шаринга нужен обычному пользователю (§7)."""
+        from .errors import FsError
+        from .metrics import fs_share_operations_total
+
+        self._identity(user)
+        if len(inputs) > self._config.max_resolve_inputs:
+            raise FsError("too many inputs", "VALIDATION")
+        try:
+            results = []
+            for value in inputs[: self._config.max_resolve_inputs]:
+                candidates = self._repo.resolve_one(str(value).strip())
+                if not candidates:
+                    status = "unresolved"
+                elif len(candidates) == 1:
+                    status = "resolved"
+                else:
+                    status = "ambiguous"
+                results.append({"input": value, "status": status, "candidates": candidates})
+        except Exception:
+            fs_share_operations_total.labels(operation="resolve_entities", outcome="error").inc()
+            raise
+        fs_share_operations_total.labels(operation="resolve_entities", outcome="ok").inc()
+        return {"results": results}
+
+    def _own_scope(self, user: str, owner_id: str) -> None:
+        """share_* — только владелец узла (§5.7); чужой → ACL_DENIED + событие."""
+        requester_id, _name = self._identity(user)
+        if requester_id != owner_id:
+            raise FsError("only the owner manages access", "ACL_DENIED")
+
+    def _notify_share_grant(
+        self,
+        *,
+        owner_id: str,
+        owner_name: str,
+        node_uuid: str,
+        node_name: str,
+        node_kind: str,
+        level: str,
+        added: list[dict[str, Any]],
+    ) -> None:
+        """Хук ADR-003 §8.4: N ≤ 50 → send; > 50/Everyone → distribute; graceful."""
+        if not added:
+            return
+        if self._notification is None:
+            self._log.warning(
+                "fs_notification_failed",
+                extra={"node_uuid": node_uuid, "recipients": len(added), "error_type": "NoModule"},
+            )
+            return
+        try:
+            user_ids = [g["grantee_id"] for g in added if g["grantee_type"] == "user"]
+            group_ids = [g["grantee_id"] for g in added if g["grantee_type"] == "group"]
+            everyone = self._repo.everyone_group_id() if self._repo is not None else None
+            scope: dict[str, Any]
+            if everyone and everyone in group_ids:
+                # Everyone — неявное membership: рассылка всем активным (§5.5, §6.1)
+                scope = {"kind": "all_active"}
+            else:
+                members = self._repo.group_member_ids(group_ids) if self._repo is not None else []
+                user_ids = list(dict.fromkeys(user_ids + members))
+                scope = {"kind": "explicit", "user_ids": user_ids}
+            payload = {
+                "actor_id": owner_id,
+                "actor_name": owner_name,
+                "node_name": node_name,
+                "node_uuid": node_uuid,
+                "node_kind": node_kind,
+                "level": level,
+            }
+            bucket = str(__import__("uuid").uuid4())
+            threshold = int(getattr(self._notification, "distribute_threshold", 50) or 50)
+            if scope["kind"] == "explicit" and len(user_ids) <= threshold:
+                self._notification.send(
+                    user_ids, "share_grant", payload, bucket=bucket, caller="fs",
+                )
+            else:
+                self._notification.distribute(
+                    "share_grant", payload, scope, bucket=bucket, caller="fs",
+                )
+        except Exception as exc:
+            # Уведомление не валит share_add: WARN + метрика notification (§8.2)
+            self._log.warning(
+                "fs_notification_failed",
+                extra={
+                    "node_uuid": node_uuid,
+                    "recipients": len(added),
+                    "error_type": exc.__class__.__name__,
+                },
+            )
 
 
 class _RetryProvision(Exception):

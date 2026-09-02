@@ -1,4 +1,4 @@
-"""FS Module — диск пользователя, песочница и (позже) шаринг (ADR-002).
+"""FS Module — диск пользователя, песочница и identity-based ACL (ADR-002).
 
 Использование:
     app.load_module("fs")
@@ -6,8 +6,7 @@
     state.fs.ensure_home(user)
     state.fs.list(user, "projects", include_size=True)
 
-Workspace остаётся тонким фасадом над state.fs (§3.1). ACL-машина и шаринг —
-шаг 5 плана (после ревью Литы).
+Workspace — тонкий фасад над state.fs (§3.1).
 """
 from __future__ import annotations
 
@@ -35,7 +34,7 @@ MODULE_VERSION = "0.1.0"
 
 
 class FsModule(ModuleBase):
-    """Домен fs: песочница /home/{unix_name}, state.fs, права fs:*."""
+    """Домен fs: песочница /home/{username} as-is, state.fs, права fs:*."""
 
     @property
     def name(self) -> str:
@@ -53,7 +52,7 @@ class FsModule(ModuleBase):
             permissions={
                 "fs:read": "Чтение своего диска и расшаренного на меня",
                 "fs:write": "Запись в свой диск и расшаренное с уровнем editor",
-                "fs:share": "Управление доступом к своим папкам (share/resolve, шаг 5)",
+                "fs:share": "Управление доступом к своим папкам (share/resolve)",
             },
             cache_rules={},
             timeout_defaults={
@@ -69,6 +68,10 @@ class FsModule(ModuleBase):
                 "trash": 30.0,
                 "git_status": 15.0,
                 "list_shared": 10.0,
+                "share_list": 10.0,
+                "share_add": 10.0,
+                "share_remove": 10.0,
+                "resolve_entities": 10.0,
             },
             dependencies=["db", "auth", "log", "notification"],
         )
@@ -92,7 +95,7 @@ class FsModule(ModuleBase):
             auth = state.services.resolve(AuthProvider)
         except Exception:
             auth = None
-        self._accessor = FsAccessor(self._config, self._log, database, auth)
+        self._accessor = FsAccessor(self._config, self._log, database, auth, getattr(state, "notification", None))
         state.fs = self._accessor
         self._provider = FsProvider(self._accessor, self._log)
         state.services.register(FsProvider, self._provider)
