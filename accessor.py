@@ -20,9 +20,11 @@ from .fs import (
     folder_stats,
     join_rel,
     move_into,
+    read_file,
     remove,
     rename_path,
     trash_move,
+    write_file,
 )
 from .gitinfo import list_repos
 from .homes import ensure_nested, ensure_unix_home, list_home, unix_name
@@ -30,7 +32,13 @@ from .homes import ensure_nested, ensure_unix_home, list_home, unix_name
 __all__ = ["FsAccessor"]
 
 # Security-коды: отказ песочницы/ACL — observation error + security event (§10)
-_SECURITY_CODES = frozenset({"PATH_ESCAPE", "SYMLINK_ESCAPE", "ACL_DENIED", "INVALID_NAME"})
+_SECURITY_CODES = frozenset({
+    "PATH_ESCAPE",
+    "SYMLINK_ESCAPE",
+    "ACL_DENIED",
+    "INVALID_NAME",
+    "INTERNAL_PATH_FORBIDDEN",
+})
 
 
 def _run_coro(coro: Any) -> Any:
@@ -63,20 +71,27 @@ class FsAccessor:
     # ── Нормализация пользователя ───────────────────────────
 
     def _username(self, raw: str) -> str:
-        """uid (uuid) → username через auth; без auth — как есть (§3)."""
-        if self._auth is not None:
-            try:
-                fn = inspect.unwrap(self._auth.get_user)
-                row = (
-                    _run_coro(fn(self._auth, raw))
-                    if inspect.iscoroutinefunction(fn)
-                    else fn(self._auth, raw)
-                )
-                if isinstance(row, dict) and row.get("username"):
-                    return str(row["username"])
-            except Exception:
-                pass
-        return raw
+        """uid (uuid) → username через auth; без auth — как есть (тестовый режим, §3).
+
+        Fail-closed: auth задан, но резолв упал или пуст → AUTH_RESOLVE_FAILED.
+        Raw-фолбэк запрещён — иначе uuid оседает как unix_name и песочницы
+        расходятся с идентичностью (ревью Литы №8)."""
+        if self._auth is None:
+            return raw
+        try:
+            fn = inspect.unwrap(self._auth.get_user)
+            row = (
+                _run_coro(fn(self._auth, raw))
+                if inspect.iscoroutinefunction(fn)
+                else fn(self._auth, raw)
+            )
+            username = str(row["username"]) if isinstance(row, dict) and row.get("username") else ""
+        except Exception:
+            username = ""
+        if not username:
+            self._log.warning("fs_auth_resolve_failed", extra={"user": str(raw)[:64]})
+            raise FsError("auth resolve failed", "AUTH_RESOLVE_FAILED")
+        return username
 
     def _home(self, user: str) -> Path:
         return Path(self._config.home_root) / unix_name(self._username(user))
@@ -84,10 +99,17 @@ class FsAccessor:
     def _scope(self, user: str, owner: str | None) -> Path:
         """Песочница операции: своя — или отказ до ACL-машины (шаг 5, §5.7).
 
+        Сравнение identity по uuid: unix_name коллизирует ("Иван"/"ivan" → ivan).
         Ни одна роль не даёт доступ к чужим папкам: без гранта (пока без
         ACL-lookup вообще) чужой owner всегда denied — fail closed.
         """
-        if not owner or unix_name(self._username(owner)) == unix_name(self._username(user)):
+        if not owner:
+            return self._home(user)
+        if self._auth is not None:
+            same = user == owner
+        else:
+            same = unix_name(self._username(user)) == unix_name(self._username(owner))
+        if same:
             return self._home(user)
         # TODO(ADR-002 шаг 5): ACL-lookup по fs.nodes/fs.acl (машина §5.4);
         # сейчас грантов нет ни у кого — чужая песочница запрещена.
@@ -191,15 +213,14 @@ class FsAccessor:
     def list(self, user: str, rel: str, *, include_hidden: bool = False, include_size: bool = False,
              owner: str | None = None) -> list[dict[str, Any]]:
         with self._measure("list", rel, user):
-            items = list_home(
+            # Лимит проверяется на обходе: не строим весь список ради отказа
+            return list_home(
                 str(self._scope(user, owner)),
                 rel,
                 include_hidden=include_hidden,
                 include_size=include_size,
+                max_entries=self._config.max_list_entries,
             )
-            if len(items) > self._config.max_list_entries:
-                raise FsError("listing too large", "LIST_TOO_LARGE")
-            return items
 
     def stat(self, user: str, rel: str, *, owner: str | None = None) -> dict[str, Any]:
         with self._measure("stat", rel, user):
@@ -228,7 +249,8 @@ class FsAccessor:
             size = path.stat().st_size
             if size > self._config.max_write_bytes:
                 raise FsError("file too large", "PAYLOAD_TOO_LARGE")
-            return {"content_b64": base64.b64encode(path.read_bytes()).decode(), "size": size}
+            # O_NOFOLLOW: подменённая между stat и чтением ссылка не читается
+            return {"content_b64": base64.b64encode(read_file(path)).decode(), "size": size}
 
     def write(self, user: str, rel: str, content_b64: str, *, owner: str | None = None) -> dict[str, Any]:
         import base64
@@ -240,9 +262,8 @@ class FsAccessor:
                 raise FsError("invalid base64", "INVALID_NAME") from exc
             if len(content) > self._config.max_write_bytes:
                 raise FsError("payload too large", "PAYLOAD_TOO_LARGE")
-            path = join_rel(self._scope(user, owner), rel)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
+            # Symlink-guard компонентов + O_NOFOLLOW финального (ревью Литы №4)
+            write_file(self._scope(user, owner), rel, content)
             return {"rel_path": rel, "size": len(content)}
 
     def move(self, user: str, src: str, dest_dir: str, *, owner: str | None = None) -> str:
@@ -267,15 +288,19 @@ class FsAccessor:
             return trashed_rel
 
     def remove_outside_home(self, path: Path) -> None:
-        """Для workspace.delete_workspace: root вне home_root (§3)."""
+        """Для workspace.delete_workspace: root вне home_root (§3).
+
+        Guard по контракту метода: внутренние пути удаляются через trash (§5)."""
         with self._measure("remove_outside_home", str(path), ""):
+            if path.resolve().is_relative_to(Path(self._config.home_root).resolve()):
+                raise FsError("internal path forbidden", "INTERNAL_PATH_FORBIDDEN")
             remove(path.parent, path.name)
 
     def git_repos(self, user: str, rel_paths: list[str], *, owner: str | None = None) -> list[dict[str, Any]]:
         with self._measure("git_status", ",".join(rel_paths)[:512], user):
             home = self._scope(user, owner)
             join_rel(home, "")  # песочница корня — валидация до git-обхода
-            return list_repos(str(home), rel_paths)
+            return list_repos(str(home), rel_paths, timeout=self._config.git_timeout)
 
     # ── Статистика (для refresh_home-фасада workspace) ──────
 

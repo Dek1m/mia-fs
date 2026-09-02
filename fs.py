@@ -2,9 +2,11 @@
 """Реальные папки/файлы FS. Путь только внутри песочницы владельца (ADR-002 §10)."""
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shutil
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,10 +14,13 @@ from .errors import FsError
 
 __all__ = [
     "safe_name",
+    "deny_component_symlinks",
     "ensure_dir",
     "join_rel",
     "mkdir",
     "touch",
+    "write_file",
+    "read_file",
     "remove",
     "folder_stats",
     "trash_move",
@@ -25,13 +30,41 @@ __all__ = [
 ]
 
 _NAME = re.compile(r"^[^/\\]{1,255}$")
+_DIR_MODE = 0o755
+_FILE_MODE = 0o644
+
+
+def _has_control_chars(value: str) -> bool:
+    """Null byte и Unicode Cf (включая bidi U+202A–202E, U+2066–2069) —
+    подмена/спуфинг имён, к классифицированному INVALID_NAME (§10)."""
+    return "\x00" in value or any(unicodedata.category(c) == "Cf" for c in value)
 
 
 def safe_name(name: str) -> str:
     value = name.strip()
-    if not value or value in {".", ".."} or not _NAME.match(value) or ".." in value:
+    if (
+        not value
+        or value in {".", ".."}
+        or not _NAME.match(value)
+        or ".." in value
+        or _has_control_chars(value)
+    ):
         raise FsError("invalid name", "INVALID_NAME")
     return value
+
+
+def deny_component_symlinks(root: Path, rel: str) -> None:
+    """Symlink-guard: каждый существующий префикс rel обязан быть реальным
+    каталогом. Останавливаемся на первом несуществующем — далее создадим сами."""
+    current = root.resolve()
+    for part in rel.strip().lstrip("/").split("/"):
+        if not part:
+            continue
+        current = current / part
+        if os.path.islink(current):
+            raise FsError("symlink escape", "SYMLINK_ESCAPE")
+        if not current.exists():
+            return
 
 
 def ensure_dir(path: Path) -> str:
@@ -40,6 +73,10 @@ def ensure_dir(path: Path) -> str:
 
 
 def join_rel(root: Path, rel: str) -> Path:
+    # Control-символы до resolve(): null byte в пути уходит в generic ValueError
+    # мимо классификации, bidi-символы — спуфинг имени в ответах API (§10)
+    if _has_control_chars(rel):
+        raise FsError("invalid path characters", "INVALID_NAME")
     target = (root / rel).resolve() if rel else root.resolve()
     try:
         target.relative_to(root.resolve())
@@ -54,11 +91,52 @@ def mkdir(root: Path, rel: str) -> Path:
     return path
 
 
+def _open_no_follow(path: Path, flags: int, mode: int) -> int:
+    """os.open c O_NOFOLLOW: финальный компонент не может быть symlink
+    (TOCTOU между проверкой и открытием). ELOOP → SYMLINK_ESCAPE."""
+    try:
+        return os.open(path, flags | os.O_NOFOLLOW, mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise FsError("symlink escape", "SYMLINK_ESCAPE") from exc
+        raise
+
+
 def touch(root: Path, rel: str) -> Path:
     path = join_rel(root, rel)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(exist_ok=True)
+    fd = _open_no_follow(path, os.O_WRONLY | os.O_CREAT, _FILE_MODE)
+    os.close(fd)
+    os.utime(path)  # контракт pathlib.touch: обновить mtime
     return path
+
+
+def write_file(root: Path, rel: str, content: bytes) -> Path:
+    """Запись в песочнице: guard существующих компонентов + атомарное
+    O_NOFOLLOW-открытие финального компонента (§10, ревью Литы №4)."""
+    deny_component_symlinks(root, rel)
+    path = join_rel(root, rel)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = _open_no_follow(path, os.O_WRONLY | os.O_CREAT, _FILE_MODE)
+    try:
+        view = memoryview(content)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+    return path
+
+
+def read_file(path: Path) -> bytes:
+    """O_NOFOLLOW-чтение: содержимое подменённой ссылки не отдаём (§10)."""
+    fd = _open_no_follow(path, os.O_RDONLY, 0)
+    try:
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def remove(root: Path, rel: str) -> None:

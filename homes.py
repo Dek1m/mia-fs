@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import FsError
-from .fs import folder_stats, join_rel, mkdir, safe_name, touch
+from .fs import deny_component_symlinks, folder_stats, join_rel, mkdir, safe_name, touch
 
 __all__ = ["unix_name", "ensure_unix_home", "list_home", "own_path", "ensure_nested"]
 
@@ -60,6 +60,8 @@ def ensure_nested(home: str, rel: str, kind: str, unix: str) -> dict[str, Any]:
     if not rel or ".." in rel:
         raise FsError("invalid path", "INVALID_NAME")
     root = Path(home).resolve()
+    # Symlink-guard до создания: существующие префиксы — только реальные каталоги
+    deny_component_symlinks(root, rel)
     parts = [safe_name(part) for part in rel.split("/") if part]
     acc: list[str] = []
     last = len(parts) - 1
@@ -85,6 +87,7 @@ def list_home(
     *,
     include_hidden: bool = False,
     include_size: bool = False,
+    max_entries: int | None = None,
 ) -> list[dict[str, Any]]:
     root = Path(home).resolve()
     path = join_rel(root, rel) if rel else root
@@ -92,6 +95,9 @@ def list_home(
         raise FsError("not a directory", "NOT_FOUND")
     items: list[dict[str, Any]] = []
     for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        # Лимит до дорогой обработки ребёнка: обход прерываем, не копим список
+        if max_entries is not None and len(items) >= max_entries:
+            raise FsError("listing too large", "LIST_TOO_LARGE")
         if child.name == "Trash":
             continue
         if child.name.startswith(".") and not include_hidden:

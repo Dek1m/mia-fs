@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 __all__ = ["FsConfig"]
 
@@ -35,8 +36,13 @@ class FsConfig:
 
     @classmethod
     def from_env(cls) -> "FsConfig":
+        raw = os.getenv("FS_HOME_ROOT") or os.getenv("WORKSPACE_HOME_ROOT") or "/home"
+        # Fail-fast при загрузке модуля: относительный home_root — песочницы
+        # разъезжаются с cwd процесса (ревью Литы №16)
+        if not Path(raw).is_absolute():
+            raise ValueError(f"FS_HOME_ROOT must be an absolute path, got {raw!r}")
         return cls(
-            home_root=os.getenv("FS_HOME_ROOT") or os.getenv("WORKSPACE_HOME_ROOT") or "/home",
+            home_root=str(Path(raw).resolve()),
             max_write_bytes=_int_env("FS_MAX_WRITE_BYTES", 10 * 1024**2),
             max_list_entries=_int_env("FS_MAX_LIST_ENTRIES", 5000),
             max_resolve_inputs=_int_env("FS_MAX_RESOLVE_INPUTS", 50),

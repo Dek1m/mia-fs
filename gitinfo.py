@@ -12,7 +12,7 @@ from .fs import join_rel
 __all__ = ["list_repos"]
 
 
-def list_repos(home: str, rel_paths: list[str]) -> list[dict[str, Any]]:
+def list_repos(home: str, rel_paths: list[str], *, timeout: float = 3.0) -> list[dict[str, Any]]:
     root = Path(home).resolve()
     seen: set[str] = set()
     items: list[dict[str, Any]] = []
@@ -25,7 +25,7 @@ def list_repos(home: str, rel_paths: list[str]) -> list[dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
-        info = _describe(git_root, root)
+        info = _describe(git_root, root, timeout)
         if info is not None:
             items.append(info)
     return items
@@ -49,13 +49,13 @@ def _find_git(start: Path, home: Path) -> Path | None:
         current = parent
 
 
-def _run(cwd: Path, *args: str) -> str:
+def _run(cwd: Path, timeout: float, *args: str) -> str:
     try:
         proc = subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -65,12 +65,12 @@ def _run(cwd: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def _describe(git_root: Path, home: Path) -> dict[str, Any] | None:
-    branch = _run(git_root, "rev-parse", "--abbrev-ref", "HEAD")
+def _describe(git_root: Path, home: Path, timeout: float) -> dict[str, Any] | None:
+    branch = _run(git_root, timeout, "rev-parse", "--abbrev-ref", "HEAD")
     if not branch:
         return None
-    dirty = bool(_run(git_root, "status", "--porcelain"))
-    origin = _run(git_root, "remote", "get-url", "origin")
+    dirty = bool(_run(git_root, timeout, "status", "--porcelain"))
+    origin = _run(git_root, timeout, "remote", "get-url", "origin")
     rel = str(git_root.relative_to(home))
     if rel == ".":
         rel = ""
