@@ -31,7 +31,7 @@ from .fs import (
     write_file,
 )
 from .gitinfo import list_repos
-from .homes import ensure_nested, ensure_unix_home, list_home
+from .homes import account_in_passwd, ensure_nested, ensure_unix_home, list_home, own_path
 
 __all__ = ["FsAccessor"]
 
@@ -254,9 +254,10 @@ class FsAccessor:
         retry по UNIQUE. Требует database (без БД — только тест-контур без привязки)."""
         if self._accounts is None:
             raise FsError("unix accounts require database", "FS_ERROR")
-        # 1. fast path: запись есть → вернуть без дисковых операций
+        # 1. fast path: запись есть. passwd мог сгореть с образом — чиним useradd.
         existing = self._accounts.find_by_user_id(user_id)
         if existing:
+            self._repair_passwd_if_missing(existing, username, require_useradd=True)
             return existing
         login = "mia-" + user_id.replace("-", "")[:8]
         home_path = str(self._root_for(username))
@@ -351,6 +352,35 @@ class FsAccessor:
             # raw rel: lstat-guard §10 п.3 обязан видеть symlink-компоненты
             return ensure_nested(str(root), rel, kind, uid)
 
+    def _repair_passwd_if_missing(
+        self,
+        account: dict[str, Any],
+        username: str,
+        *,
+        require_useradd: bool = False,
+    ) -> None:
+        """Строка в unix_accounts есть, /etc/passwd пуст → повторный useradd.
+
+        mkdir/touch/write не ждут passwd: числовой chown достаточен.
+        require_useradd=True (ensure_home) — падаем, если useradd снова не смог."""
+        uid = int(account["unix_uid"])
+        login = str(account["login"])
+        if account_in_passwd(uid, login):
+            return
+        self._log.warning(
+            "unix_account_missing_passwd",
+            extra={"unix_uid": uid, "login": login},
+        )
+        try:
+            ensure_unix_home(uid, login, username, self._config.home_root)
+        except FsError as exc:
+            self._log.error(
+                "unix_account_useradd_failed",
+                extra={"unix_uid": uid, "login": login, "error": str(exc)[:200]},
+            )
+            if require_useradd or exc.code == "UNIX_ACCOUNT_MISMATCH":
+                raise
+
     def _uid_for_chown(self, user: str) -> int:
         """UID владельца для chown созданных путей. Нет привязки → uid воркера:
         привязка тома для v1 не критична, воркер пишет своим uid."""
@@ -358,9 +388,12 @@ class FsAccessor:
 
         if self._accounts is None:
             return os.getuid()
-        user_id, _username = self._identity(user)
+        user_id, username = self._identity(user)
         account = self._accounts.find_by_user_id(user_id)
-        return int(account["unix_uid"]) if account else os.getuid()
+        if not account:
+            return os.getuid()
+        self._repair_passwd_if_missing(account, username)
+        return int(account["unix_uid"])
 
     def read(self, user: str, rel: str, *, owner: str | None = None) -> dict[str, Any]:
         """Содержимое файла b64; лимит max_write_bytes на payload (§10 п.6)."""
@@ -389,7 +422,8 @@ class FsAccessor:
                 raise FsError("payload too large", "PAYLOAD_TOO_LARGE")
             root, _canon_rel = self._sandbox(user, owner, rel, need="editor")
             # raw rel в write_file: O_NOFOLLOW + lstat-guard (§10 п.3)
-            write_file(root, rel, content)
+            path = write_file(root, rel, content)
+            own_path(path, self._uid_for_chown(owner or user))
             return {"rel_path": _canon_rel, "size": len(content)}
 
     def move(self, user: str, src: str, dest_dir: str, *, owner: str | None = None) -> str:

@@ -16,19 +16,41 @@ from typing import Any
 from .errors import FsError
 from .fs import deny_component_symlinks, folder_stats, join_rel, mkdir, safe_name, touch
 
-__all__ = ["ensure_unix_home", "list_home", "own_path", "ensure_nested"]
+__all__ = [
+    "account_in_passwd",
+    "ensure_unix_home",
+    "list_home",
+    "own_path",
+    "ensure_nested",
+]
 
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 
 
+def account_in_passwd(uid: int, login: str) -> bool:
+    """login и uid оба есть в /etc/passwd и сходятся.
+
+    unix_accounts в Postgres переживает recreate контейнера, passwd — нет."""
+    try:
+        by_name = pwd.getpwnam(login)
+        by_uid = pwd.getpwuid(uid)
+    except KeyError:
+        return False
+    return by_name.pw_uid == uid and by_uid.pw_name == login
+
+
 def own_path(path: Path, uid: int, gid: int | None = None) -> None:
     """Владелец — unix-аккаунт из fs.unix_accounts: chown {uid}:{gid} + 700/600.
 
-    gid не задан (до useradd-записи) — берётся из passwd по uid. Ошибки chown
-    не глотаются молча: привязка тома — часть контракта провижининга (§3.1)."""
+    os.chown принимает числовой uid/gid без записи в passwd — mkdir/touch/write
+    не зависят от getpwuid. gid: passwd если uid есть, иначе gid=uid.
+    Ошибки chown не глотаются: привязка тома — контракт провижининга (§3.1)."""
     if gid is None:
-        gid = pwd.getpwuid(uid).pw_gid
+        try:
+            gid = pwd.getpwuid(uid).pw_gid
+        except KeyError:
+            gid = uid
     os.chown(path, uid, gid)
     os.chmod(path, _DIR_MODE if path.is_dir() else _FILE_MODE)
 
@@ -46,14 +68,23 @@ def ensure_unix_home(
       id -u {login} == uid → догоняем диск и запись; ≠ uid → UNIX_ACCOUNT_MISMATCH
       (внешнее вмешательство в том — ручная чистка + security-событие);
     - каталог уже существует (миграция): mkdir -p no-op, chown/chmod поверх,
-      контент не трогается.
+      контент не трогается;
+    - запись в БД есть, passwd пуст (recreate контейнера): повторный useradd
+      тем же uid/login, затем chown.
 
     Запись в fs.unix_accounts пишет вызывающий (accounts_repository.insert) —
     идемпотентный retry ловит UNIQUE на своей стороне."""
     home = Path(home_root) / username
-    try:
-        pwd.getpwnam(login)
-    except KeyError:
+    if not account_in_passwd(uid, login):
+        try:
+            existing = pwd.getpwnam(login).pw_uid
+        except KeyError:
+            existing = None
+        if existing is not None and existing != uid:
+            raise FsError(
+                f"unix account {login} owned by uid {existing}, expected {uid}",
+                "UNIX_ACCOUNT_MISMATCH",
+            )
         proc = subprocess.run(
             [
                 "useradd", "-M", "-N", "-u", str(uid), "-l",
@@ -66,12 +97,12 @@ def ensure_unix_home(
         if proc.returncode != 0 and "already exists" in (proc.stderr or "").lower():
             # Крах прошлого прогона: сверяем UID существующего аккаунта
             try:
-                existing = pwd.getpwnam(login).pw_uid
+                recovered = pwd.getpwnam(login).pw_uid
             except KeyError as exc:
                 raise FsError("unix account vanished", "UNIX_ACCOUNT_MISMATCH") from exc
-            if existing != uid:
+            if recovered != uid:
                 raise FsError(
-                    f"unix account {login} owned by uid {existing}, expected {uid}",
+                    f"unix account {login} owned by uid {recovered}, expected {uid}",
                     "UNIX_ACCOUNT_MISMATCH",
                 )
         elif proc.returncode != 0:
