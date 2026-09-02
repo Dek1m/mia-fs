@@ -32,7 +32,7 @@ class FsProvider:
         api=True,
         permission="fs:read",
         name="ensure_home",
-        description="Создать unix-пользователя и ~/ если ещё нет → {home, unix_name}",
+        description="Создать unix-аккаунт и ~/ если ещё нет → {home, username, unix_uid, login}",
         args={},
         return_type="dict",
     )

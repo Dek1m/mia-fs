@@ -1,8 +1,11 @@
 """FsAccessor — фасад state.fs (ADR-002 §3).
 
 Домен fs — один пользователь-владелец за вызов. Первый аргумент user —
-uid (uuid) или username; нормализуется через auth и unix_name. Никаких
-путей вне песочницы: join_rel валидирует resolve() внутри home.
+uid (uuid) или username; резолвится в identity через auth. Домашняя папка —
+/home/{username} as-is (ревизия 6: ни lower, ни вырезаний; биекцию путей
+гарантирует UNIQUE(username) в auth). Unix-аккаунт (UID, login) — системная
+привязка в fs.unix_accounts, identity пользователя не является. Никаких путей
+вне песочницы: join_rel валидирует resolve() внутри home.
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .accounts_repository import UnixAccountsRepository
 from .config import FsConfig
 from .errors import FsError
 from .fs import (
@@ -27,7 +31,7 @@ from .fs import (
     write_file,
 )
 from .gitinfo import list_repos
-from .homes import ensure_nested, ensure_unix_home, list_home, unix_name
+from .homes import ensure_nested, ensure_unix_home, list_home
 
 __all__ = ["FsAccessor"]
 
@@ -38,6 +42,7 @@ _SECURITY_CODES = frozenset({
     "ACL_DENIED",
     "INVALID_NAME",
     "INTERNAL_PATH_FORBIDDEN",
+    "UNIX_ACCOUNT_MISMATCH",
 })
 
 
@@ -67,53 +72,62 @@ class FsAccessor:
         self._log = log
         self._database = database
         self._auth = auth
+        self._accounts = UnixAccountsRepository(database) if database is not None else None
 
     # ── Нормализация пользователя ───────────────────────────
 
-    def _username(self, raw: str) -> str:
-        """uid (uuid) → username через auth; без auth — как есть (тестовый режим, §3).
+    def _auth_call(self, method: str, arg: str) -> dict[str, Any] | None:
+        fn = inspect.unwrap(getattr(self._auth, method))
+        if inspect.iscoroutinefunction(fn):
+            return _run_coro(fn(self._auth, arg))
+        # unwrap у @task снимает wrapper и boundness; живой bound-метод — самодостаточен
+        if hasattr(fn, "__self__"):
+            return fn(arg)
+        return fn(self._auth, arg)
 
-        Fail-closed: auth задан, но резолв упал или пуст → AUTH_RESOLVE_FAILED.
-        Raw-фолбэк запрещён — иначе uuid оседает как unix_name и песочницы
-        расходятся с идентичностью (ревью Литы №8)."""
+    def _identity(self, raw: str) -> tuple[str, str]:
+        """raw (uuid | username) → (user_id, username) через auth.
+
+        Без auth — raw как есть по обеим осям (тестовый режим, §3).
+        Fail-closed: auth задан, но резолв упал или пуст → AUTH_RESOLVE_FAILED —
+        иначе uuid/username оседают вперемешку и песочницы расходятся
+        с идентичностью (ревью Литы №8)."""
         if self._auth is None:
-            return raw
+            return raw, raw
+        row: dict[str, Any] | None = None
         try:
-            fn = inspect.unwrap(self._auth.get_user)
-            row = (
-                _run_coro(fn(self._auth, raw))
-                if inspect.iscoroutinefunction(fn)
-                else fn(self._auth, raw)
-            )
-            username = str(row["username"]) if isinstance(row, dict) and row.get("username") else ""
+            if len(raw) == 36 and raw.count("-") == 4:
+                row = self._auth_call("get_user", raw)
+            else:
+                row = self._auth_call("get_user_by_username", raw)
         except Exception:
-            username = ""
-        if not username:
+            row = None
+        if not isinstance(row, dict) or not row.get("id") or not row.get("username"):
             self._log.warning("fs_auth_resolve_failed", extra={"user": str(raw)[:64]})
             raise FsError("auth resolve failed", "AUTH_RESOLVE_FAILED")
-        return username
+        return str(row["id"]), str(row["username"])
 
-    def _home(self, user: str) -> Path:
-        return Path(self._config.home_root) / unix_name(self._username(user))
+    def _root_for(self, username: str) -> Path:
+        """Корень песочницы владельца: /home/{username} as-is, без нормализации."""
+        return Path(self._config.home_root) / username
 
-    def _scope(self, user: str, owner: str | None) -> Path:
-        """Песочница операции: своя — или отказ до ACL-машины (шаг 5, §5.7).
+    def _sandbox(self, user: str, owner: str | None, rel: str) -> tuple[Path, str]:
+        """Песочница операции: (канонический корень, канонический rel).
 
-        Сравнение identity по uuid: unix_name коллизирует ("Иван"/"ivan" → ivan).
-        Ни одна роль не даёт доступ к чужим папкам: без гранта (пока без
-        ACL-lookup вообще) чужой owner всегда denied — fail closed.
-        """
-        if not owner:
-            return self._home(user)
-        if self._auth is not None:
-            same = user == owner
-        else:
-            same = unix_name(self._username(user)) == unix_name(self._username(owner))
-        if same:
-            return self._home(user)
-        # TODO(ADR-002 шаг 5): ACL-lookup по fs.nodes/fs.acl (машина §5.4);
-        # сейчас грантов нет ни у кого — чужая песочница запрещена.
-        raise FsError("acl lookup not available", "ACL_DENIED")
+        Порядок обязательный (аксиома §5.4): join_rel (песочница) →
+        канонический rel → ACL-машина → диск. Сырой rel от клиента в ACL
+        не попадает никогда — иначе LIKE-префикс открывает обход через `..`."""
+        requester_id, requester_name = self._identity(user)
+        owner_id, owner_name = (requester_id, requester_name)
+        if owner is not None:
+            owner_id, owner_name = self._identity(owner)
+        root = self._root_for(owner_name).resolve()
+        resolved = join_rel(root, rel)
+        canon_rel = resolved.relative_to(root).as_posix()
+        if owner_id != requester_id:
+            # TODO(ADR-002 шаг 5): ACL-lookup fs.nodes/fs.acl (машина §5.4)
+            raise FsError("acl lookup not available", "ACL_DENIED")
+        return root, canon_rel
 
     @contextmanager
     def _measure(self, operation: str, rel_path: str, user: str) -> Iterator[None]:
@@ -180,43 +194,108 @@ class FsAccessor:
                 },
             )
 
-    # ── Провижининг ─────────────────────────────────────────
+    # ── Провижининг (§3.1) ──────────────────────────────────
 
     def ensure_home(self, user: str) -> dict[str, Any]:
-        """useradd + mkdir + chown, идемпотентно. → {home, unix_name}."""
-        username = unix_name(self._username(user))
-        home = self._home(user)
+        """Флоу ensure_unix_home: fast path → локи → uid → useradd → chown → INSERT.
+
+        → {home, username, unix_uid, login}; идемпотентен на любом шаге."""
+        user_id, username = self._identity(user)
         with self._measure("ensure_home", "", user):
-            if not home.exists():
-                ensure_unix_home(username, self._config.home_root)
-                self._log.info(
-                    "fs_home_provisioned",
-                    extra={"unix_name": username, "home": str(home)},
-                )
-        return {"home": str(home), "unix_name": username}
+            account = self._ensure_unix_account(user_id, username)
+            self._log.info(
+                "fs_home_provisioned",
+                extra={"username": username, "home": account["home_path"], "login": account["login"]},
+            )
+            self._log.debug(
+                "fs_home_uid",
+                extra={"username": username, "unix_uid": account["unix_uid"]},
+            )
+        return {
+            "home": account["home_path"],
+            "username": username,
+            "unix_uid": int(account["unix_uid"]),
+            "login": account["login"],
+        }
+
+    def _ensure_unix_account(self, user_id: str, username: str) -> dict[str, Any]:
+        """Шаги 1–5 флоу §3.1. Идемпотентен: fast path, double-check под локом,
+        retry по UNIQUE. Требует database (без БД — только тест-контур без привязки)."""
+        if self._accounts is None:
+            raise FsError("unix accounts require database", "FS_ERROR")
+        # 1. fast path: запись есть → вернуть без дисковых операций
+        existing = self._accounts.find_by_user_id(user_id)
+        if existing:
+            return existing
+        login = "mia-" + user_id.replace("-", "")[:8]
+        home_path = str(self._root_for(username))
+        while True:
+            try:
+                with self._database.transaction() as conn:
+                    # 2. оба xact-лока в фиксированном порядке fs_uid → per-user
+                    self._accounts.acquire_provision_locks(user_id, conn=conn)
+                    # double-check: запись могла появиться, пока ждали лок
+                    raced = self._accounts.find_by_user_id(user_id, conn=conn)
+                    if raced:
+                        return raced
+                    uid = self._accounts.next_uid(
+                        self._config.uid_min, self._config.uid_max, conn=conn,
+                    )
+                    # 3–4. useradd + mkdir + chown 700; идемпотентно, контент
+                    # существующего каталога (миграция) не трогается
+                    ensure_unix_home(uid, login, username, self._config.home_root)
+                    # 5. INSERT записи; UNIQUE-гонка → retry-lookup
+                    self._accounts.insert(user_id, uid, login, home_path, conn=conn)
+                    created = self._accounts.find_by_user_id(user_id, conn=conn)
+                    if created:
+                        return created
+                    # INSERT не закрепился (ON CONFLICT) — повтор с fast path
+                    raise _RetryProvision()
+            except _RetryProvision:
+                continue
+            except Exception as exc:
+                # UNIQUE(login/unix_uid/home_path) → второй воркер читает строку
+                if _is_unique_violation(exc):
+                    retry = self._accounts.find_by_user_id(user_id)
+                    if retry:
+                        return retry
+                    continue
+                raise
 
     def home_for(self, user: str) -> str:
-        """Резолв пути без создания (валидация unix_name)."""
-        return str(self._home(user))
+        """Резолв home_path из fs.unix_accounts без создания (§10).
+
+        Нет записи (провижининг не выполнялся) — /home/{username} as-is:
+        путь детерминирован username, привязка нужна только для UID."""
+        _user_id, username = self._identity(user)
+        if self._accounts is not None:
+            account = self._accounts.find_by_user_id(_user_id)
+            if account:
+                return str(account["home_path"])
+        return str(self._root_for(username))
 
     # ── Диск (rel — относительно home) ──────────────────────
 
     def exists(self, user: str, rel: str, *, owner: str | None = None) -> bool:
         with self._measure("exists", rel, user):
-            return join_rel(self._scope(user, owner), rel).exists()
+            root, canon_rel = self._sandbox(user, owner, rel)
+            path = root / canon_rel if canon_rel else root
+            return path.exists()
 
     def resolve(self, user: str, rel: str, *, owner: str | None = None) -> Path:
         """Canonical путь + проверка песочницы владельца."""
         with self._measure("resolve", rel, user):
-            return join_rel(self._scope(user, owner), rel)
+            root, canon_rel = self._sandbox(user, owner, rel)
+            return root / canon_rel if canon_rel else root
 
     def list(self, user: str, rel: str, *, include_hidden: bool = False, include_size: bool = False,
              owner: str | None = None) -> list[dict[str, Any]]:
         with self._measure("list", rel, user):
+            root, canon_rel = self._sandbox(user, owner, rel)
             # Лимит проверяется на обходе: не строим весь список ради отказа
             return list_home(
-                str(self._scope(user, owner)),
-                rel,
+                str(root),
+                canon_rel,
                 include_hidden=include_hidden,
                 include_size=include_size,
                 max_entries=self._config.max_list_entries,
@@ -224,26 +303,41 @@ class FsAccessor:
 
     def stat(self, user: str, rel: str, *, owner: str | None = None) -> dict[str, Any]:
         with self._measure("stat", rel, user):
-            path = join_rel(self._scope(user, owner), rel)
+            root, canon_rel = self._sandbox(user, owner, rel)
+            path = root / canon_rel if canon_rel else root
             if path.is_dir():
-                return {"rel_path": rel, "kind": "folder", "child_count": dir_child_count(path)}
+                return {"rel_path": canon_rel, "kind": "folder", "child_count": dir_child_count(path)}
             if not path.exists():
                 raise FsError("not found", "NOT_FOUND")
-            return {"rel_path": rel, "kind": "file", "size": path.stat().st_size}
+            return {"rel_path": canon_rel, "kind": "file", "size": path.stat().st_size}
 
     def ensure_nested(self, user: str, rel: str, kind: str, *, owner: str | None = None) -> dict[str, Any]:
         if kind not in {"folder", "file"}:
             raise FsError("invalid kind", "INVALID_NAME")
-        with self._measure("ensure_nested", rel, user):
-            home = self._scope(user, owner)
-            return ensure_nested(str(home), rel, kind, unix_name(self._username(user)))
+        with self._measure("mkdir" if kind == "folder" else "touch", rel, user):
+            root, _canon_rel = self._sandbox(user, owner, rel)
+            uid = self._uid_for_chown(owner or user)
+            # raw rel: lstat-guard §10 п.3 обязан видеть symlink-компоненты
+            return ensure_nested(str(root), rel, kind, uid)
+
+    def _uid_for_chown(self, user: str) -> int:
+        """UID владельца для chown созданных путей. Нет привязки → uid воркера:
+        привязка тома для v1 не критична, воркер пишет своим uid."""
+        import os
+
+        if self._accounts is None:
+            return os.getuid()
+        user_id, _username = self._identity(user)
+        account = self._accounts.find_by_user_id(user_id)
+        return int(account["unix_uid"]) if account else os.getuid()
 
     def read(self, user: str, rel: str, *, owner: str | None = None) -> dict[str, Any]:
         """Содержимое файла b64; лимит max_write_bytes на payload (§10 п.6)."""
         import base64
 
         with self._measure("read", rel, user):
-            path = join_rel(self._scope(user, owner), rel)
+            root, canon_rel = self._sandbox(user, owner, rel)
+            path = root / canon_rel if canon_rel else root
             if not path.is_file():
                 raise FsError("not found", "NOT_FOUND")
             size = path.stat().st_size
@@ -262,29 +356,35 @@ class FsAccessor:
                 raise FsError("invalid base64", "INVALID_NAME") from exc
             if len(content) > self._config.max_write_bytes:
                 raise FsError("payload too large", "PAYLOAD_TOO_LARGE")
-            # Symlink-guard компонентов + O_NOFOLLOW финального (ревью Литы №4)
-            write_file(self._scope(user, owner), rel, content)
-            return {"rel_path": rel, "size": len(content)}
+            root, _canon_rel = self._sandbox(user, owner, rel)
+            # raw rel в write_file: O_NOFOLLOW + lstat-guard (§10 п.3)
+            write_file(root, rel, content)
+            return {"rel_path": _canon_rel, "size": len(content)}
 
     def move(self, user: str, src: str, dest_dir: str, *, owner: str | None = None) -> str:
         with self._measure("move", src, user):
-            home = self._scope(user, owner)
-            new_rel = move_into(home, src, dest_dir)
-            # TODO(ADR-002 шаг 5): UPDATE fs.nodes.path/display_name (§5.2) через FsRepository.
+            root, _canon_src = self._sandbox(user, owner, src)
+            _dest_root, _canon_dest = self._sandbox(user, owner, dest_dir)
+            new_rel = move_into(root, src, dest_dir)
+            self._registry_after_move(root, new_rel)
             return new_rel
 
     def rename(self, user: str, src: str, new_name: str, *, owner: str | None = None) -> str:
         with self._measure("rename", src, user):
-            home = self._scope(user, owner)
-            new_rel = rename_path(home, src, new_name)
-            # TODO(ADR-002 шаг 5): UPDATE fs.nodes.path/display_name (§5.2) через FsRepository.
+            root, _canon_src = self._sandbox(user, owner, src)
+            new_rel = rename_path(root, src, new_name)
+            self._registry_after_move(root, new_rel)
             return new_rel
+
+    def _registry_after_move(self, root: Path, new_rel: str) -> None:
+        # TODO(ADR-002 шаг 5): UPDATE fs.nodes.path/display_name (§5.2) — FsRepository
+        return None
 
     def trash(self, user: str, rel: str, *, owner: str | None = None) -> str:
         with self._measure("trash", rel, user):
-            home = self._scope(user, owner)
-            trashed_rel = trash_move(home, rel)
-            # TODO(ADR-002 шаг 5): UPDATE fs.nodes.deleted_at (§5.2) через FsRepository.
+            root, _canon_rel = self._sandbox(user, owner, rel)
+            trashed_rel = trash_move(root, rel)
+            # TODO(ADR-002 шаг 5): UPDATE fs.nodes.deleted_at (§5.2) — FsRepository
             return trashed_rel
 
     def remove_outside_home(self, path: Path) -> None:
@@ -298,11 +398,24 @@ class FsAccessor:
 
     def git_repos(self, user: str, rel_paths: list[str], *, owner: str | None = None) -> list[dict[str, Any]]:
         with self._measure("git_status", ",".join(rel_paths)[:512], user):
-            home = self._scope(user, owner)
-            join_rel(home, "")  # песочница корня — валидация до git-обхода
-            return list_repos(str(home), rel_paths, timeout=self._config.git_timeout)
+            root, _rel = self._sandbox(user, owner, "")
+            return list_repos(str(root), rel_paths, timeout=self._config.git_timeout)
 
     # ── Статистика (для refresh_home-фасада workspace) ──────
 
     def folder_stats(self, path: Path) -> tuple[int, int]:
         return folder_stats(path)
+
+
+class _RetryProvision(Exception):
+    """Внутренний сигнал: INSERT не закрепился — повторить флоу с fast path."""
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """psycopg UniqueViolation (23505): UNIQUE(login/unix_uid/home_path)."""
+    current: BaseException | None = exc
+    while current is not None:
+        if getattr(current, "pgcode", None) == "23505":
+            return True
+        current = current.__cause__
+    return False

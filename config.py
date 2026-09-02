@@ -33,6 +33,8 @@ class FsConfig:
     default_page_size: int = 50           # FS_DEFAULT_PAGE_SIZE
     max_page_size: int = 200              # FS_MAX_PAGE_SIZE
     git_timeout: float = 3.0              # FS_GIT_TIMEOUT
+    uid_min: int = 10000                  # FS_UID_MIN — нижняя граница выдаваемых unix UID (§3.1)
+    uid_max: int = 60000                  # FS_UID_MAX — верхняя граница; исчерпание → UID_EXHAUSTED
 
     @classmethod
     def from_env(cls) -> "FsConfig":
@@ -49,4 +51,6 @@ class FsConfig:
             default_page_size=_int_env("FS_DEFAULT_PAGE_SIZE", 50),
             max_page_size=_int_env("FS_MAX_PAGE_SIZE", 200),
             git_timeout=_float_env("FS_GIT_TIMEOUT", 3.0),
+            uid_min=_int_env("FS_UID_MIN", 10000),
+            uid_max=_int_env("FS_UID_MAX", 60000),
         )
