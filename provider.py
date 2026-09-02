@@ -239,4 +239,23 @@ class FsProvider:
         self._user(_session_user_id)
         # TODO(ADR-002 шаг 5): SELECT по fs.nodes × fs.acl с membership + Everyone (§9);
         # до ACL-машины грантов не существует — честный пустой список.
+        #
+        # Ленивая регистрация узла — один CTE, не INSERT+SELECT двумя стейтментами.
+        # Предикат deleted_at IS NULL в conflict_target ОБЯЗАТЕЛЕН: без него PG
+        # не найдёт арбитра частичного индекса nodes_owner_path_live_idx (§5.0):
+        #   WITH ins AS (
+        #       INSERT INTO fs.nodes (owner_user_id, path, node_type, display_name)
+        #       VALUES (:owner, :path, :type, basename(:path))
+        #       ON CONFLICT (owner_user_id, path) WHERE deleted_at IS NULL
+        #       DO NOTHING RETURNING node_uuid)
+        #   SELECT node_uuid FROM ins
+        #   UNION ALL
+        #   SELECT node_uuid FROM fs.nodes
+        #   WHERE owner_user_id = :owner AND path = :path AND deleted_at IS NULL
+        #   LIMIT 1;
+        #
+        # Арбитраж повторных грантов ДОСЛОВНО повторяет выражение
+        # acl_unique_grant_idx (§5.1), иначе ON CONFLICT не найдёт арбитр:
+        #   ON CONFLICT (node_uuid, grantee_type, COALESCE(grantee_user_id, grantee_group_id))
+        #   DO NOTHING;
         return {"items": []}

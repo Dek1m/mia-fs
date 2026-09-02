@@ -12,4 +12,6 @@ CREATE TABLE IF NOT EXISTS fs.nodes (
 -- один живой узел на путь владельца (ленивая регистрация идемпотентна)
 CREATE UNIQUE INDEX IF NOT EXISTS nodes_owner_path_live_idx
     ON fs.nodes (owner_user_id, path) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS nodes_owner_idx ON fs.nodes (owner_user_id);
+-- (owner_user_id, path): list по владельцу (префикс), restore из trash
+-- (owner+path при deleted_at IS NOT NULL), ACL-prefix-матч
+CREATE INDEX IF NOT EXISTS nodes_owner_path_idx ON fs.nodes (owner_user_id, path);
