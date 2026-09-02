@@ -74,6 +74,10 @@ class FsModule(ModuleBase):
                 "resolve_entities": 10.0,
             },
             dependencies=["db", "auth", "log", "notification"],
+            load_on="all",
+            is_system=False,
+            display_name="Files",
+            is_example=False,
         )
 
     def __init__(self, config: FsConfig | None = None) -> None:

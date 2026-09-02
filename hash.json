@@ -1,7 +1,7 @@
 {
   "version": "0.1.0",
   "files": {
-    "__init__.py": "d70d972c55de85bb57538dcab86e3293e709a843bceeeb55a8ab3be0dc5a582f",
+    "__init__.py": "457870630f758300fde1dbb7f1d994017c14197be3915073804a1ea68ad4abea",
     "accessor.py": "5ef315bba27ce451ac0e2c8773be0027e8b6a07fc91d3cc60295ccc1e53f1727",
     "accounts_repository.py": "764195c1a6147d01af35c659c7f325ffd10b0dc17e80dbd6125c714fcc74d650",
     "config.py": "2140a200f037c48ec8d03704117ae742881387fe1c7d2a443b65f3711000eeac",
@@ -14,5 +14,5 @@
     "repository.py": "0b48143833ab7fcfb1093147bf5b351cedce1911556b4bbea49579dffa2653c5",
     "schema.py": "826621774073a2c0103d2cbdad5819cef7fe93296f77152903bd2f48df58bf80"
   },
-  "manifest_hash": "843b0ec4c8bb30bc3ae2c6929ef6b35b7fdc164bb483913a7d27671a4e03a8f9"
+  "manifest_hash": "55c7cc8fb616fba5152a5939a850e1f2fedc8fd5f8e20ed8892537c9b9acb34c"
 }
