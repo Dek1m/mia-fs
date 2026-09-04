@@ -4,7 +4,7 @@
     "__init__.py": "457870630f758300fde1dbb7f1d994017c14197be3915073804a1ea68ad4abea",
     "accessor.py": "5ef315bba27ce451ac0e2c8773be0027e8b6a07fc91d3cc60295ccc1e53f1727",
     "accounts_repository.py": "764195c1a6147d01af35c659c7f325ffd10b0dc17e80dbd6125c714fcc74d650",
-    "config.py": "2140a200f037c48ec8d03704117ae742881387fe1c7d2a443b65f3711000eeac",
+    "config.py": "928369f2f50cf0faf6780e72d6fe4094ba8aabb734930a5ed7dd383722c57b39",
     "errors.py": "4793ab4924a89fdf9d9cdd76ae4be6165e09b07450414237e19cb882f83bd6c6",
     "fs.py": "7edbbe9824ce8520b168dfcd36f62feae73a2caa201be1f2067b22119d61e3fe",
     "gitinfo.py": "e5a7958148e996ad8295ffadc9b2797bb5a131c917e212685a9a6f24371d4f6d",
@@ -14,5 +14,5 @@
     "repository.py": "0b48143833ab7fcfb1093147bf5b351cedce1911556b4bbea49579dffa2653c5",
     "schema.py": "826621774073a2c0103d2cbdad5819cef7fe93296f77152903bd2f48df58bf80"
   },
-  "manifest_hash": "55c7cc8fb616fba5152a5939a850e1f2fedc8fd5f8e20ed8892537c9b9acb34c"
+  "manifest_hash": "bc8a044a0923fafe4f49a56c5db9af64d02f9cac6f52f8c4d8c24e234a1ca326"
 }
